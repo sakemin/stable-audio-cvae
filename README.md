@@ -5,7 +5,7 @@ Drum one shot generation/interpolation with cvae based on stable-audio's vae mod
 
 Run the commands below.
 ```bash
-$ pip install torch==2.1.0 torchaudio==2.1.0
+$ pip install torch==2.5.0 torchaudio==2.5.0
 $ pip install -r requirements.txt
 ```
 
