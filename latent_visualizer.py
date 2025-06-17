@@ -4,6 +4,7 @@ Latent Space Visualizer - Standalone Web Application
 Run this script and open http://localhost:8050 in your browser
 """
 
+import datetime
 import numpy as np
 import pandas as pd
 from sklearn.manifold import TSNE
@@ -23,6 +24,8 @@ from stable_audio_tools import get_pretrained_model
 sample_dict = None  # Your sample_dict from the notebook
 vae = None  # Your VAE model
 sr = 44100  # Sample rate
+audio_length = 2 * 44100
+
 
 # Load sample_dict from JSON
 def load_sample_dict_from_json(filepath):
@@ -39,6 +42,7 @@ def load_sample_dict_from_json(filepath):
   print(f"Loaded sample_dict from {filepath}")
   return sample_dict
 
+
 # Example of loading (uncomment to use)
 sample_dict = load_sample_dict_from_json("sample_dict.json")
 
@@ -46,12 +50,14 @@ model, config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
 vae = model.pretransform.model  # 전체 모델에서 VAE 부분만 추출
 vae.eval()  # 평가 모드로 전환
 
+
 def set_data(your_sample_dict, your_vae, your_sr=44100):
   """Call this function to set your data before running the app"""
   global sample_dict, vae, sr
   sample_dict = your_sample_dict
   vae = your_vae
   sr = your_sr
+
 
 def load_data():
   """Load and prepare data"""
@@ -62,37 +68,33 @@ def load_data():
     return None, None, None, None
   
   print("Loading and processing data...")
-  
-  # Flatten and collect data
-  latents = []
-  labels = []
-  filenames = []
-  latent_dict = {}
+
+  df = pd.DataFrame(None, columns=['index', 'filename', 'label', 'latent', 'flattened', 'x', 'y', 'z'], index=None)
 
   for label, files in sample_dict.items():
     for fname, latent in files.items():
-      flat = latent.flatten().cpu().numpy()
-      latents.append(flat)
-      labels.append(label)
-      filenames.append(fname)
-      latent_dict[fname] = latent
+      df.loc[len(df)] = [
+        len(df),
+        fname,
+        label,
+        latent,
+        latent.flatten().cpu().numpy(),
+        None,
+        None,
+        None
+      ]
 
-  latents = np.stack(latents)
-  print(f"Loaded {len(latents)} samples")
+  return df
 
-  # Dimensionality reduction
-  print("Performing t-SNE dimensionality reduction...")
+
+def reduce(df):
+  latents = np.stack(df['flattened'].tolist())
   tsne = TSNE(n_components=3, random_state=42, perplexity=min(10, len(latents)-1))
   latents_3d = tsne.fit_transform(latents)
+  df['x'] = latents_3d[:, 0]
+  df['y'] = latents_3d[:, 1]
+  df['z'] = latents_3d[:, 2]
 
-  # Prepare DataFrame
-  df = pd.DataFrame(latents_3d, columns=['x', 'y', 'z'])
-  df['label'] = labels
-  df['filename'] = filenames
-  df['index'] = range(len(df))  # Add index for point identification
-  
-  print("Data processing complete!")
-  return df, latent_dict, filenames, labels
 
 def create_audio_base64(audio_data, sample_rate=44100):
   """Convert audio numpy array to base64 for web playback"""
@@ -135,11 +137,55 @@ def create_audio_base64(audio_data, sample_rate=44100):
     print(f"Audio tensor shape: {audio_tensor.shape}")
     print(f"Audio tensor dtype: {audio_tensor.dtype}")
     raise e
+  
+
+def load_uploaded_audio(contents, filename, date):
+  content_type, content_string = contents.split(',')
+
+  decoded = base64.b64decode(content_string)
+  try:
+    if 'wav' in filename:
+      y, sr = torchaudio.load(io.BytesIO(decoded))
+      if y.ndim == 1:
+        y = y.unsqueeze(0)
+      if y.shape[0] > 2:
+        y = y[:2, :]
+      if y.shape[0] == 1:
+        y = y.repeat(2, 1)
+      if sr != 44100:
+        y = torchaudio.transforms.Resample(sr, 44100)(y)
+      print(f"Loaded WAV file: {filename} at {sr}Hz")
+  except Exception as e:
+    print(e)
+    return html.Div([
+      'There was an error processing this file.'
+    ])
+  
+  if y.shape[1] > audio_length:
+    # Truncate if longer than 2 seconds
+    y = y[:,  audio_length]
+  elif y.shape[1] < audio_length:
+    # Zero pad if shorter than 2 seconds
+    pad_length = audio_length - y.shape[1]
+    y = torch.nn.functional.pad(y, (0, pad_length))
+
+  latent = vae.encode(y.unsqueeze(0))
+  audio_src = create_audio_base64(y.numpy(), sr)
+
+  return html.Div([
+    html.H5(filename),
+
+    html.Hr(),  # horizontal line
+
+    html.Audio(src=audio_src, controls=True, autoPlay=True),
+  ]), latent
+
 
 def create_app():
   """Create and configure the Dash app"""
   # Load data
-  df, latent_dict, filenames, labels = load_data()
+  df = load_data()
+  reduce(df)
   
   if df is None:
     print("Failed to load data. Exiting.")
@@ -182,7 +228,7 @@ def create_app():
     dcc.Graph(
       id='3d-plot',
       figure=fig_3d,
-      style={'height': '50vh', 'width': '100%'}  # Reduced from 80vh to 50vh
+      style={'height': '80vh', 'width': '100%'}  # Reduced from 80vh to 50vh
     ),
     
     # Store for selected points
@@ -191,6 +237,29 @@ def create_app():
     
     # Control panels in a more compact layout
     html.Div([
+      html.Div([
+        dcc.Upload(
+          id='upload-data',
+          children=html.Div([
+            'Drag and Drop or ',
+            html.A('Select Files')
+          ]),
+          style={
+            'width': '100%',
+            'height': '60px',
+            'lineHeight': '60px',
+            'borderWidth': '1px',
+            'borderStyle': 'dashed',
+            'borderRadius': '5px',
+            'textAlign': 'center',
+            'margin': '10px'
+          },
+          # Allow multiple files to be uploaded
+          multiple=False
+        ),
+        html.Div(id='output-data-upload')
+      ]),
+
       # Single file playback (triggered by clicks)
       html.Div([
         html.H3("🎵 Single File Playback", style={'margin': '10px 0'}),
@@ -265,7 +334,7 @@ def create_app():
       label = df.iloc[point_index]['label']
       
       # Play the audio (single file playback)
-      latent = latent_dict[filename]
+      latent = latent = df.iloc[point_index]['latent']
       with torch.no_grad():
         decoded = vae.decode(latent).squeeze().cpu().numpy().squeeze()
       
@@ -338,8 +407,8 @@ def create_app():
       filename1 = df.iloc[selected_indices[0]]['filename']
       filename2 = df.iloc[selected_indices[1]]['filename']
       
-      latent1 = latent_dict[filename1]
-      latent2 = latent_dict[filename2]
+      latent1 = df.iloc[selected_indices[0]]['latent']
+      latent2 = df.iloc[selected_indices[1]]['latent']
       
       # Linear interpolation
       interpolated_latent = (1 - alpha) * latent1 + alpha * latent2
@@ -367,6 +436,50 @@ def create_app():
     if n_clicks > 0:
       return [], "Click points to select them for interpolation"
     return [], "Click points to select them for interpolation"
+  
+
+  @app.callback(
+    [Output('output-data-upload', 'children'),
+     Output('3d-plot', 'figure')],
+    Input('upload-data', 'contents'),
+    State('upload-data', 'filename'),
+    State('upload-data', 'last_modified')
+  )
+  def handle_upload(content, fn, date):
+    if content is not None:
+      children, latent = load_uploaded_audio(content, fn, date)
+      df.loc[len(df)] = [
+        len(df),
+        fn,
+        "User",
+        latent,
+        latent.flatten().cpu().numpy(),
+        None,
+        None,
+        None
+      ]
+      reduce(df)
+      fig_3d = px.scatter_3d(
+        df, x='x', y='y', z='z',
+        color='label',
+        hover_name='filename',
+        title='Latent Space Visualization - Click points to play audio!'
+      )
+      fig_3d.update_traces(marker=dict(size=8))  # Slightly larger for easier clicking
+      fig_3d.update_layout(
+        clickmode='event+select',
+        dragmode='select',  # Enable selection by default
+        scene=dict(
+          dragmode='orbit'  # Allow 3D rotation
+        ),
+        modebar=dict(
+          add=['select2d', 'lasso2d']
+        )
+      )
+      return children, fig_3d
+    return html.Div([
+      'Drag and Drop or Select a WAV file to upload and visualize its latent space.'
+    ]), dash.no_update
   
   return app
 

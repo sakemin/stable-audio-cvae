@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 from copy import deepcopy
 from typing import Optional, Literal
 
-from ..models.autoencoders import AudioAutoencoder, fold_channels_into_batch, unfold_channels_from_batch
+from ..models.autoencoders import AudioAutoencoder, AudioConditionalVariationalAutoEncoder, fold_channels_into_batch, unfold_channels_from_batch
 from ..models.discriminators import EncodecDiscriminator, OobleckDiscriminator, DACGANLoss, BigVGANDiscriminator
 from ..models.bottleneck import VAEBottleneck, RVQBottleneck, DACRVQBottleneck, DACRVQVAEBottleneck, RVQVAEBottleneck, WassersteinBottleneck
 from .losses import MelSpectrogramLoss, MultiLoss, AuralossLoss, ValueLoss, TargetValueLoss, L1Loss, LossWithTarget, MSELoss, HubertLoss, PESQMetric
@@ -28,6 +28,63 @@ def trim_to_shortest(a, b):
         return a, b[:,:,:a.shape[-1]]
     return a, b
 
+def extract_condition_from_metadata(metadata, cond_keys=None):
+    """Extract condition from metadata dict or list of dicts.
+    
+    Returns tensor in shape (B,C) for categorical conditions where C=1.
+    """
+    if cond_keys is None:
+        # Default condition keys to look for
+        cond_keys = ['condition', 'conditioning', 'cond', 'labels', 'class']
+    
+    # Handle case where metadata is a list (batch of metadata dicts)
+    if isinstance(metadata, (list, tuple)):
+        if len(metadata) == 0:
+            return None
+        
+        # Extract conditions from each item in the batch
+        conditions = []
+        for item in metadata:
+            if isinstance(item, dict):
+                for key in cond_keys:
+                    if key in item:
+                        cond = item[key]
+                        if isinstance(cond, (int, float)):
+                            conditions.append(cond)
+                        elif isinstance(cond, (list, tuple)):
+                            conditions.append(cond[0] if len(cond) > 0 else 0)
+                        elif torch.is_tensor(cond):
+                            conditions.append(cond.item() if cond.dim() == 0 else cond[0].item())
+                        break
+                else:
+                    # No condition found for this item - use default
+                    conditions.append(0)
+        
+        if conditions:
+            # Return shape (B, C) where C=1 for categorical
+            return torch.tensor(conditions, dtype=torch.long).unsqueeze(1)
+    
+    # Handle case where metadata is a single dict
+    elif isinstance(metadata, dict):
+        for key in cond_keys:
+            if key in metadata:
+                cond = metadata[key]
+                if isinstance(cond, (int, float)):
+                    # Return shape (B, C) where B=1, C=1
+                    return torch.tensor([[cond]], dtype=torch.long)
+                elif isinstance(cond, (list, tuple)):
+                    # Return shape (B, C) where B=1, C=1
+                    return torch.tensor([[cond[0] if len(cond) > 0 else 0]], dtype=torch.long)
+                elif torch.is_tensor(cond):
+                    if cond.dim() == 0:
+                        return cond.unsqueeze(0).unsqueeze(1).long()
+                    elif cond.dim() == 1:
+                        return cond.unsqueeze(1).long()
+                    else:
+                        return cond.long()
+    
+    return None
+
 class AutoencoderTrainingWrapper(pl.LightningModule):
     def __init__(
             self,
@@ -45,7 +102,8 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             force_input_mono = False,
             latent_mask_ratio = 0.0,
             teacher_model: Optional[AudioAutoencoder] = None,
-            clip_grad_norm = 0.0
+            clip_grad_norm = 0.0,
+            cond_keys: Optional[list] = None
     ):
         super().__init__()
 
@@ -62,6 +120,10 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         self.force_input_mono = force_input_mono
 
         self.teacher_model = teacher_model
+        
+        # Check if this is a conditional autoencoder
+        self.is_conditional = isinstance(autoencoder, AudioConditionalVariationalAutoEncoder)
+        self.cond_keys = cond_keys
 
         if optimizer_configs is None:
             optimizer_configs ={
@@ -299,19 +361,35 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                 return [opt_gen], [sched_gen]
             return [opt_gen]
 
-    def forward(self, reals):
-        latents, encoder_info = self.autoencoder.encode(reals, return_info=True)
-        decoded = self.autoencoder.decode(latents)
+    def forward(self, reals, condition=None):
+        if self.is_conditional and condition is not None:
+            latents, encoder_info = self.autoencoder.encode(reals, condition=condition, return_info=True)
+            decoded = self.autoencoder.decode(latents, condition=condition)
+        else:
+            latents, encoder_info = self.autoencoder.encode(reals, return_info=True)
+            decoded = self.autoencoder.decode(latents)
         return decoded
 
     def validation_step(self, batch, batch_idx):
-        reals, _ = batch
+        if len(batch) == 2:
+            reals, metadata = batch
+        else:
+            reals = batch
+            metadata = None
+            
         # Remove extra dimension added by WebDataset
         if reals.ndim == 4 and reals.shape[0] == 1:
             reals = reals[0]
 
         if len(reals.shape) == 2:
             reals = reals.unsqueeze(1)
+
+        # Extract condition for conditional autoencoder
+        condition = None
+        if self.is_conditional and metadata is not None:
+            condition = extract_condition_from_metadata(metadata, self.cond_keys)
+            if condition is not None:
+                condition = condition.to(reals.device)
 
         loss_info = {}
 
@@ -327,11 +405,16 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         data_std = encoder_input.std()
 
         with torch.no_grad():
-            latents, encoder_info = self.autoencoder.encode(encoder_input, return_info=True)
+            if self.is_conditional and condition is not None:
+                latents, encoder_info = self.autoencoder.encode(encoder_input, condition=condition, return_info=True)
+                decoded = self.autoencoder.decode(latents, condition=condition)
+            else:
+                latents, encoder_info = self.autoencoder.encode(encoder_input, return_info=True)
+                decoded = self.autoencoder.decode(latents)
+                
             loss_info["latents"] = latents
             loss_info.update(encoder_info)
 
-            decoded = self.autoencoder.decode(latents)
             #Trim output to remove post-padding.
             decoded, reals = trim_to_shortest(decoded, reals)
 
@@ -365,7 +448,11 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         self.validation_step_outputs.clear()  # free memory
 
     def training_step(self, batch, batch_idx):
-        reals, _ = batch
+        if len(batch) == 2:
+            reals, metadata = batch
+        else:
+            reals = batch
+            metadata = None
 
         log_dict = {}
         # Remove extra dimension added by WebDataset
@@ -377,6 +464,35 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
         if self.global_step >= self.warmup_steps:
             self.warmed_up = True
+
+        # Extract condition for conditional autoencoder
+        condition = None
+        if self.is_conditional and metadata is not None:
+            # Debug logging for conditional autoencoder (only for first few batches)
+            if batch_idx < 3:  # Log only first 3 batches to avoid spam
+                print(f"[DEBUG] Batch {batch_idx}: Extracting condition from metadata")
+                if isinstance(metadata, dict):
+                    available_keys = list(metadata.keys())
+                    print(f"[DEBUG] Available metadata keys: {available_keys}")
+                elif isinstance(metadata, (list, tuple)) and len(metadata) > 0:
+                    if isinstance(metadata[0], dict):
+                        available_keys = list(metadata[0].keys())
+                        print(f"[DEBUG] Available metadata keys (first item): {available_keys}")
+                        print(f"[DEBUG] Batch size: {len(metadata)}")
+            
+            condition = extract_condition_from_metadata(metadata, self.cond_keys)
+            if condition is not None:
+                condition = condition.to(reals.device)
+                if batch_idx < 3:
+                    print(f"[DEBUG] Extracted condition: shape={condition.shape}, dtype={condition.dtype}")
+                    print(f"[DEBUG] Sample conditions: {condition[:min(5, len(condition))].tolist()}")
+            else:
+                if batch_idx < 3:
+                    print(f"[DEBUG] Failed to extract condition from metadata!")
+                    if isinstance(metadata, dict):
+                        print(f"[DEBUG] Metadata sample: {dict(list(metadata.items())[:3])}")
+                    elif isinstance(metadata, (list, tuple)) and len(metadata) > 0:
+                        print(f"[DEBUG] Metadata[0] sample: {dict(list(metadata[0].items())[:3]) if isinstance(metadata[0], dict) else metadata[0]}")
 
         loss_info = {}
 
@@ -393,9 +509,15 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
         if self.warmed_up and self.encoder_freeze_on_warmup:
             with torch.no_grad():
-                latents, encoder_info = self.autoencoder.encode(encoder_input, return_info=True)
+                if self.is_conditional and condition is not None:
+                    latents, encoder_info = self.autoencoder.encode(encoder_input, condition=condition, return_info=True)
+                else:
+                    latents, encoder_info = self.autoencoder.encode(encoder_input, return_info=True)
         else:
-            latents, encoder_info = self.autoencoder.encode(encoder_input, return_info=True)
+            if self.is_conditional and condition is not None:
+                latents, encoder_info = self.autoencoder.encode(encoder_input, condition=condition, return_info=True)
+            else:
+                latents, encoder_info = self.autoencoder.encode(encoder_input, return_info=True)
 
         loss_info["latents"] = latents
 
@@ -404,7 +526,14 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         # Encode with teacher model for distillation
         if self.teacher_model is not None:
             with torch.no_grad():
-                teacher_latents = self.teacher_model.encode(encoder_input, return_info=False)
+                if hasattr(self.teacher_model, 'encode') and callable(getattr(self.teacher_model, 'encode')):
+                    # Check if teacher model is also conditional
+                    if isinstance(self.teacher_model, AudioConditionalVariationalAutoEncoder) and condition is not None:
+                        teacher_latents = self.teacher_model.encode(encoder_input, condition=condition, return_info=False)
+                    else:
+                        teacher_latents = self.teacher_model.encode(encoder_input, return_info=False)
+                else:
+                    teacher_latents = self.teacher_model(encoder_input)
                 loss_info['teacher_latents'] = teacher_latents
 
         # Optionally mask out some latents for noise resistance
@@ -412,7 +541,10 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             mask = torch.rand_like(latents) < self.latent_mask_ratio
             latents = torch.where(mask, torch.zeros_like(latents), latents)
 
-        decoded = self.autoencoder.decode(latents)
+        if self.is_conditional and condition is not None:
+            decoded = self.autoencoder.decode(latents, condition=condition)
+        else:
+            decoded = self.autoencoder.decode(latents)
 
         #Trim output to remove post-padding
         decoded, reals = trim_to_shortest(decoded, reals)
@@ -429,9 +561,19 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         # Distillation
         if self.teacher_model is not None:
             with torch.no_grad():
-                teacher_decoded = self.teacher_model.decode(teacher_latents)
-                own_latents_teacher_decoded = self.teacher_model.decode(latents) #Distilled model's latents decoded by teacher
-                teacher_latents_own_decoded = self.autoencoder.decode(teacher_latents) #Teacher's latents decoded by distilled model
+                # Teacher decode - check if teacher is conditional
+                if isinstance(self.teacher_model, AudioConditionalVariationalAutoEncoder) and condition is not None:
+                    teacher_decoded = self.teacher_model.decode(teacher_latents, condition=condition)
+                    own_latents_teacher_decoded = self.teacher_model.decode(latents, condition=condition) #Distilled model's latents decoded by teacher
+                else:
+                    teacher_decoded = self.teacher_model.decode(teacher_latents)
+                    own_latents_teacher_decoded = self.teacher_model.decode(latents)
+                
+                # Student decode teacher latents
+                if self.is_conditional and condition is not None:
+                    teacher_latents_own_decoded = self.autoencoder.decode(teacher_latents, condition=condition) #Teacher's latents decoded by distilled model
+                else:
+                    teacher_latents_own_decoded = self.autoencoder.decode(teacher_latents)
 
                 loss_info['teacher_decoded'] = teacher_decoded
                 loss_info['own_latents_teacher_decoded'] = own_latents_teacher_decoded
@@ -544,7 +686,8 @@ class AutoencoderDemoCallback(pl.Callback):
         demo_every=2000,
         sample_size=65536,
         sample_rate=44100,
-        max_demos = 8
+        max_demos = 8,
+        cond_keys: Optional[list] = None
     ):
         super().__init__()
         self.demo_every = demo_every
@@ -553,6 +696,7 @@ class AutoencoderDemoCallback(pl.Callback):
         self.sample_rate = sample_rate
         self.last_demo_step = -1
         self.max_demos = max_demos
+        self.cond_keys = cond_keys
 
 
     @rank_zero_only
@@ -564,7 +708,13 @@ class AutoencoderDemoCallback(pl.Callback):
         module.eval()
 
         try:
-            demo_reals, _ = next(self.demo_dl)
+            demo_batch = next(self.demo_dl)
+            
+            if len(demo_batch) == 2:
+                demo_reals, demo_metadata = demo_batch
+            else:
+                demo_reals = demo_batch
+                demo_metadata = None
 
             # Remove extra dimension added by WebDataset
             if demo_reals.ndim == 4 and demo_reals.shape[0] == 1:
@@ -573,6 +723,9 @@ class AutoencoderDemoCallback(pl.Callback):
             # Limit the number of demo samples
             if demo_reals.shape[0] > self.max_demos:
                 demo_reals = demo_reals[:self.max_demos,...]
+                if demo_metadata is not None:
+                    if isinstance(demo_metadata, (list, tuple)):
+                        demo_metadata = demo_metadata[:self.max_demos]
 
             encoder_input = demo_reals
             encoder_input = encoder_input.to(module.device)
@@ -582,13 +735,28 @@ class AutoencoderDemoCallback(pl.Callback):
 
             demo_reals = demo_reals.to(module.device)
 
+            # Extract condition for conditional autoencoder
+            condition = None
+            if module.is_conditional and demo_metadata is not None:
+                condition = extract_condition_from_metadata(demo_metadata, self.cond_keys)
+                if condition is not None:
+                    condition = condition.to(module.device)
+
             with torch.no_grad():
                 if module.use_ema:
-                    latents = module.autoencoder_ema.ema_model.encode(encoder_input)
-                    fakes = module.autoencoder_ema.ema_model.decode(latents)
+                    if module.is_conditional and condition is not None:
+                        latents = module.autoencoder_ema.ema_model.encode(encoder_input, condition=condition)
+                        fakes = module.autoencoder_ema.ema_model.decode(latents, condition=condition)
+                    else:
+                        latents = module.autoencoder_ema.ema_model.encode(encoder_input)
+                        fakes = module.autoencoder_ema.ema_model.decode(latents)
                 else:
-                    latents = module.autoencoder.encode(encoder_input)
-                    fakes = module.autoencoder.decode(latents)
+                    if module.is_conditional and condition is not None:
+                        latents = module.autoencoder.encode(encoder_input, condition=condition)
+                        fakes = module.autoencoder.decode(latents, condition=condition)
+                    else:
+                        latents = module.autoencoder.encode(encoder_input)
+                        fakes = module.autoencoder.decode(latents)
 
             #Trim output to remove post-padding.
             fakes, demo_reals = trim_to_shortest(fakes.detach(), demo_reals)

@@ -894,7 +894,6 @@ def create_autoencoder_from_config(config: Dict[str, Any]):
         bottleneck = create_bottleneck_from_config(bottleneck)
 
     soft_clip = ae_config["decoder"].get("soft_clip", False)
-
     return AudioAutoencoder(
         encoder,
         decoder,
@@ -971,4 +970,529 @@ def create_diffAE_from_config(config: Dict[str, Any]):
         diffusion_downsampling_ratio=diffusion_downsampling_ratio,
         bottleneck=bottleneck,
         pretransform=pretransform
+    )
+
+# ---------------------------------------------------------------------------
+# Conditional VAE components
+# ---------------------------------------------------------------------------
+
+class ConditionEmbedding(nn.Module):
+    """Maps raw condition to fixed-dim vector.
+
+    * If `cond_def` is **int**: treat as continuous dim.
+    * If **Sequence[int]**: treat as multi-categorical (one embedding/table per
+      category, then average).
+    """
+
+    def __init__(self, cond_def, embed_dim: int):
+        super().__init__()
+        self.embed_dim = embed_dim
+        if isinstance(cond_def, int):
+            self._mode = "continuous"
+            self.proj = nn.Linear(cond_def, embed_dim)
+        else:
+            self._mode = "categorical"
+            self.tables = nn.ModuleList([
+                nn.Embedding(num_embeddings=n_cls, embedding_dim=embed_dim)
+                for n_cls in cond_def
+            ])
+
+    def forward(self, c: torch.Tensor) -> torch.Tensor:  # (B,*) -> (B,E)
+        if self._mode == "continuous":
+            return self.proj(c)
+        # categorical
+        if c.dim() != 2:
+            raise RuntimeError("Categorical condition must be (B,C)")
+        
+        # Handle case where we have multiple categories
+        if c.shape[1] > 1:
+            embs = [tbl(c[:, i]) for i, tbl in enumerate(self.tables)]  # list[(B,E)]
+            return torch.stack(embs, 0).mean(0)
+        # Handle case where we have single category (C=1)
+        else:
+            return self.tables[0](c[:, 0])  # Use first (and only) embedding table
+
+
+class FiLM(nn.Module):
+    """Feature-wise Linear Modulation: y = x * (1+γ) + β."""
+
+    def __init__(self, in_channels: int, cond_dim: int):
+        super().__init__()
+        self.to_scale_shift = nn.Linear(cond_dim, in_channels * 2)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor):
+        # x: (B,C,T), c: (B,D)
+        scale, shift = self.to_scale_shift(c).chunk(2, dim=-1)
+        scale = scale.unsqueeze(-1)  # (B,C,1)
+        shift = shift.unsqueeze(-1)
+        return x * (1 + scale) + shift
+
+
+class ConditionalEncoder(nn.Module):
+    """Wrapper around encoder that applies FiLM conditioning at intermediate layers."""
+    
+    def __init__(self, encoder, cond_embed_dim: int):
+        super().__init__()
+        self.encoder = encoder
+        self.cond_embed_dim = cond_embed_dim
+        self.encoder_type = self._detect_encoder_type(encoder)
+        
+        # Create FiLM layers based on encoder type
+        self.film_layers = nn.ModuleDict()
+        self._setup_film_layers(encoder, cond_embed_dim)
+        
+    def _detect_encoder_type(self, encoder):
+        """Detect the type of encoder."""
+        if hasattr(encoder, 'encoder') and hasattr(encoder.encoder, 'block'):
+            return 'dac'
+        elif hasattr(encoder, 'layers'):
+            return 'oobleck'  # or other layer-based encoders
+        else:
+            return 'unknown'
+    
+    def _setup_film_layers(self, encoder, cond_embed_dim):
+        """Setup FiLM layers based on encoder architecture."""
+        if self.encoder_type == 'dac':
+            # DAC encoder has encoder.block structure
+            if hasattr(encoder.encoder, 'block'):
+                for i, layer in enumerate(encoder.encoder.block):
+                    if hasattr(layer, 'out_channels'):
+                        out_channels = layer.out_channels
+                    elif hasattr(layer, 'conv') and hasattr(layer.conv, 'out_channels'):
+                        out_channels = layer.conv.out_channels
+                    else:
+                        continue
+                    self.film_layers[f'film_{i}'] = FiLM(out_channels, cond_embed_dim)
+                        
+        elif self.encoder_type == 'oobleck':
+            # Oobleck encoder has layers structure
+            for i, layer in enumerate(encoder.layers):
+                if hasattr(layer, 'out_channels'):
+                    out_channels = layer.out_channels
+                elif hasattr(layer, 'layers') and len(layer.layers) > 0:
+                    # For encoder blocks, try to get output channels from last conv layer
+                    last_layer = layer.layers[-1]
+                    if hasattr(last_layer, 'out_channels'):
+                        out_channels = last_layer.out_channels
+                    else:
+                        continue
+                else:
+                    continue
+                self.film_layers[f'film_{i}'] = FiLM(out_channels, cond_embed_dim)
+        
+        # If no FiLM layers were created, add a fallback
+        if len(self.film_layers) == 0:
+            # Try to get output channels from a test forward pass
+            test_input = torch.randn(1, 1, 1024)
+            with torch.no_grad():
+                try:
+                    test_output = encoder(test_input)
+                    out_channels = test_output.shape[1]
+                    self.film_layers['film_final'] = FiLM(out_channels, cond_embed_dim)
+                except Exception:
+                    # Last resort fallback
+                    self.film_layers['film_final'] = FiLM(32, cond_embed_dim)
+                    
+    def forward(self, x: torch.Tensor, cond_emb: torch.Tensor):
+        """Forward pass with conditioning."""
+        if self.encoder_type == 'dac':
+            return self._forward_dac(x, cond_emb)
+        elif self.encoder_type == 'oobleck':
+            return self._forward_oobleck(x, cond_emb)
+        else:
+            return self._forward_fallback(x, cond_emb)
+    
+    def _forward_dac(self, x: torch.Tensor, cond_emb: torch.Tensor):
+        """Forward pass for DAC encoder."""
+        h = x
+        
+        # Apply DAC encoder blocks with FiLM conditioning
+        for i, layer in enumerate(self.encoder.encoder.block):
+            h = layer(h)
+            film_key = f'film_{i}'
+            if film_key in self.film_layers:
+                h = self.film_layers[film_key](h, cond_emb)
+        
+        # Apply projection if exists
+        if hasattr(self.encoder, 'proj_out'):
+            h = self.encoder.proj_out(h)
+            
+        return h
+    
+    def _forward_oobleck(self, x: torch.Tensor, cond_emb: torch.Tensor):
+        """Forward pass for Oobleck encoder."""
+        h = x
+        
+        for i, layer in enumerate(self.encoder.layers):
+            h = layer(h)
+            # Apply FiLM conditioning if available for this layer
+            film_key = f'film_{i}'
+            if film_key in self.film_layers:
+                h = self.film_layers[film_key](h, cond_emb)
+                
+        return h
+    
+    def _forward_fallback(self, x: torch.Tensor, cond_emb: torch.Tensor):
+        """Fallback forward pass."""
+        h = self.encoder(x)
+        # Apply final FiLM conditioning
+        if 'film_final' in self.film_layers:
+            h = self.film_layers['film_final'](h, cond_emb)
+        return h
+
+
+class ConditionalDecoder(nn.Module):
+    """Wrapper around decoder that applies FiLM conditioning at intermediate layers."""
+    
+    def __init__(self, decoder, cond_embed_dim: int, input_channels: int = 32):
+        super().__init__()
+        self.decoder = decoder
+        self.cond_embed_dim = cond_embed_dim
+        self.decoder_type = self._detect_decoder_type(decoder)
+        
+        # Pre-conditioning for latent space
+        self.pre_film = FiLM(input_channels, cond_embed_dim)
+        
+        # Create FiLM layers based on decoder type
+        self.film_layers = nn.ModuleDict()
+        self._setup_film_layers(decoder, cond_embed_dim)
+        
+    def _detect_decoder_type(self, decoder):
+        """Detect the type of decoder."""
+        if hasattr(decoder, 'decoder') and hasattr(decoder.decoder, 'layers'):
+            return 'dac'
+        elif hasattr(decoder, 'layers'):
+            return 'oobleck'
+        else:
+            return 'unknown'
+    
+    def _setup_film_layers(self, decoder, cond_embed_dim):
+        """Setup FiLM layers based on decoder architecture."""
+        if self.decoder_type == 'dac':
+            # DAC decoder structure
+            if hasattr(decoder.decoder, 'layers'):
+                for i, layer in enumerate(decoder.decoder.layers):
+                    if hasattr(layer, 'in_channels'):
+                        in_channels = layer.in_channels
+                    elif hasattr(layer, 'conv') and hasattr(layer.conv, 'in_channels'):
+                        in_channels = layer.conv.in_channels
+                    else:
+                        continue
+                    self.film_layers[f'film_{i}'] = FiLM(in_channels, cond_embed_dim)
+                    
+        elif self.decoder_type == 'oobleck':
+            # Oobleck decoder structure
+            for i, layer in enumerate(decoder.layers):
+                if hasattr(layer, 'in_channels'):
+                    in_channels = layer.in_channels
+                elif hasattr(layer, 'layers') and len(layer.layers) > 0:
+                    # For decoder blocks, try to get input channels from first conv layer
+                    first_layer = layer.layers[0]
+                    if hasattr(first_layer, 'in_channels'):
+                        in_channels = first_layer.in_channels
+                    else:
+                        continue
+                else:
+                    continue
+                self.film_layers[f'film_{i}'] = FiLM(in_channels, cond_embed_dim)
+                    
+    def forward(self, x: torch.Tensor, cond_emb: torch.Tensor):
+        """Forward pass with conditioning."""
+        # Always apply pre-conditioning to latent space
+        h = self.pre_film(x, cond_emb)
+        
+        if self.decoder_type == 'dac':
+            return self._forward_dac(h, cond_emb)
+        elif self.decoder_type == 'oobleck':
+            return self._forward_oobleck(h, cond_emb)
+        else:
+            return self._forward_fallback(h, cond_emb)
+    
+    def _forward_dac(self, x: torch.Tensor, cond_emb: torch.Tensor):
+        """Forward pass for DAC decoder."""
+        h = x
+        
+        # Apply DAC decoder layers with FiLM conditioning
+        if hasattr(self.decoder.decoder, 'layers'):
+            for i, layer in enumerate(self.decoder.decoder.layers):
+                film_key = f'film_{i}'
+                if film_key in self.film_layers:
+                    h = self.film_layers[film_key](h, cond_emb)
+                h = layer(h)
+        else:
+            h = self.decoder(h)
+            
+        return h
+    
+    def _forward_oobleck(self, x: torch.Tensor, cond_emb: torch.Tensor):
+        """Forward pass for Oobleck decoder."""
+        h = x
+        
+        for i, layer in enumerate(self.decoder.layers):
+            # Apply FiLM conditioning before the layer if available
+            film_key = f'film_{i}'
+            if film_key in self.film_layers:
+                h = self.film_layers[film_key](h, cond_emb)
+            h = layer(h)
+                
+        return h
+    
+    def _forward_fallback(self, x: torch.Tensor, cond_emb: torch.Tensor):
+        """Fallback forward pass."""
+        return self.decoder(x)
+
+
+class AudioConditionalVariationalAutoEncoder(AudioAutoencoder):
+    """Conditional Audio VAE that inherits from AudioAutoencoder.
+    
+    Maintains compatibility with existing training code while adding
+    conditional encoding/decoding capabilities.
+    """
+    
+    def __init__(
+        self,
+        encoder,
+        decoder,
+        latent_dim,
+        downsampling_ratio,
+        sample_rate,
+        cond_def,  # int for continuous, Sequence[int] for categorical
+        cond_embed_dim: int = 256,
+        io_channels=2,
+        bottleneck = None,
+        pretransform = None,
+        in_channels = None,
+        out_channels = None,
+        soft_clip = False,
+        **kwargs
+    ):
+        # Initialize parent class
+        super().__init__(
+            encoder=encoder,
+            decoder=decoder,
+            latent_dim=latent_dim,
+            downsampling_ratio=downsampling_ratio,
+            sample_rate=sample_rate,
+            io_channels=io_channels,
+            bottleneck=bottleneck,
+            pretransform=pretransform,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            soft_clip=soft_clip,
+            **kwargs
+        )
+        
+        # Conditioning components
+        self.cond_def = cond_def
+        self.cond_embed_dim = cond_embed_dim
+        self.cond_embed = ConditionEmbedding(cond_def, cond_embed_dim)
+        
+        # Wrap encoder and decoder with conditional versions
+        self.conditional_encoder = ConditionalEncoder(self.encoder, cond_embed_dim)
+        self.conditional_decoder = ConditionalDecoder(self.decoder, cond_embed_dim, input_channels=latent_dim)
+        
+        # FiLM layer before bottleneck for latent conditioning
+        # Dynamically detect encoder output channels
+        test_input = torch.randn(1, self.in_channels, 1024)
+        with torch.no_grad():
+            try:
+                if hasattr(self, 'conditional_encoder'):
+                    # For conditional encoder, we need to also pass a dummy condition
+                    dummy_cond = torch.zeros(1, 1, dtype=torch.long)
+                    dummy_cond_emb = self.cond_embed(dummy_cond)
+                    test_output = self.conditional_encoder(test_input, dummy_cond_emb)
+                else:
+                    test_output = encoder(test_input)
+                latent_channels = test_output.shape[1]
+            except Exception as e:
+                print(f"Warning: Could not detect encoder output channels, using latent_dim={latent_dim}")
+                latent_channels = latent_dim
+                
+        self.film_latent = FiLM(latent_channels, cond_embed_dim)
+        
+    def encode(self, audio, condition=None, skip_bottleneck: bool = False, return_info=False, skip_pretransform=False, iterate_batch=False, **kwargs):
+        """Encode with optional conditioning.
+        
+        Args:
+            audio: Input audio tensor
+            condition: Conditioning tensor (optional, for backward compatibility)
+            Other args same as parent class
+        """
+        info = {}
+
+        if self.pretransform is not None and not skip_pretransform:
+            if self.pretransform.enable_grad:
+                if iterate_batch:
+                    audios = []
+                    for i in range(audio.shape[0]):
+                        audios.append(self.pretransform.encode(audio[i:i+1]))
+                    audio = torch.cat(audios, dim=0)
+                else:
+                    audio = self.pretransform.encode(audio)
+            else:
+                with torch.no_grad():
+                    if iterate_batch:
+                        audios = []
+                        for i in range(audio.shape[0]):
+                            audios.append(self.pretransform.encode(audio[i:i+1]))
+                        audio = torch.cat(audios, dim=0)
+                    else:
+                        audio = self.pretransform.encode(audio)
+
+        if self.encoder is not None:
+            if condition is not None:
+                # Use conditional encoding
+                cond_emb = self.cond_embed(condition)
+                if iterate_batch:
+                    latents = []
+                    for i in range(audio.shape[0]):
+                        latents.append(self.conditional_encoder(audio[i:i+1], cond_emb[i:i+1]))
+                    latents = torch.cat(latents, dim=0)
+                else:
+                    latents = self.conditional_encoder(audio, cond_emb)
+                    
+                # Apply latent FiLM conditioning
+                latents = self.film_latent(latents, cond_emb)
+            else:
+                # Fallback to unconditional encoding for backward compatibility
+                if iterate_batch:
+                    latents = []
+                    for i in range(audio.shape[0]):
+                        latents.append(self.encoder(audio[i:i+1]))
+                    latents = torch.cat(latents, dim=0)
+                else:
+                    latents = self.encoder(audio)
+        else:
+            latents = audio
+
+        info["pre_bottleneck_latents"] = latents
+
+        if self.bottleneck is not None and not skip_bottleneck:
+            latents, bottleneck_info = self.bottleneck.encode(latents, return_info=True, **kwargs)
+            info.update(bottleneck_info)
+        
+        if return_info:
+            return latents, info
+
+        return latents
+
+    def decode(self, latents, condition=None, skip_bottleneck: bool = False, iterate_batch=False, **kwargs):
+        """Decode with optional conditioning.
+        
+        Args:
+            latents: Latent tensor
+            condition: Conditioning tensor (optional, for backward compatibility)
+            Other args same as parent class
+        """
+        if self.bottleneck is not None and not skip_bottleneck:
+            if iterate_batch:
+                decoded = []
+                for i in range(latents.shape[0]):
+                    decoded.append(self.bottleneck.decode(latents[i:i+1]))
+                latents = torch.cat(decoded, dim=0)
+            else:
+                latents = self.bottleneck.decode(latents)
+
+        if condition is not None:
+            # Use conditional decoding
+            cond_emb = self.cond_embed(condition)
+            if iterate_batch:
+                decoded = []
+                for i in range(latents.shape[0]):
+                    decoded.append(self.conditional_decoder(latents[i:i+1], cond_emb[i:i+1]))
+                decoded = torch.cat(decoded, dim=0)
+            else:
+                decoded = self.conditional_decoder(latents, cond_emb)
+        else:
+            # Fallback to unconditional decoding for backward compatibility
+            if iterate_batch:
+                decoded = []
+                for i in range(latents.shape[0]):
+                    decoded.append(self.decoder(latents[i:i+1]))
+                decoded = torch.cat(decoded, dim=0)
+            else:
+                decoded = self.decoder(latents, **kwargs)
+
+        if self.pretransform is not None:
+            if self.pretransform.enable_grad:
+                if iterate_batch:
+                    decodeds = []
+                    for i in range(decoded.shape[0]):
+                        decodeds.append(self.pretransform.decode(decoded[i:i+1]))
+                    decoded = torch.cat(decodeds, dim=0)
+                else:
+                    decoded = self.pretransform.decode(decoded)
+            else:
+                with torch.no_grad():
+                    if iterate_batch:
+                        decodeds = []
+                        for i in range(decoded.shape[0]):
+                            decodeds.append(self.pretransform.decode(decoded[i:i+1]))
+                        decoded = torch.cat(decodeds, dim=0)
+                    else:
+                        decoded = self.pretransform.decode(decoded)
+
+        if self.soft_clip:
+            decoded = torch.tanh(decoded)
+        
+        return decoded
+
+    def forward(self, audio, condition=None):
+        """Forward pass for training compatibility."""
+        latents, encoder_info = self.encode(audio, condition=condition, return_info=True)
+        decoded = self.decode(latents, condition=condition)
+        return decoded
+
+
+def create_conditional_autoencoder_from_config(config: Dict[str, Any]):
+    """Create conditional autoencoder from config."""
+    
+    ae_config = config["model"]
+
+    encoder = create_encoder_from_config(ae_config["encoder"])
+    decoder = create_decoder_from_config(ae_config["decoder"])
+
+    bottleneck = ae_config.get("bottleneck", None)
+
+    latent_dim = ae_config.get("latent_dim", None)
+    assert latent_dim is not None, "latent_dim must be specified in model config"
+    downsampling_ratio = ae_config.get("downsampling_ratio", None)
+    assert downsampling_ratio is not None, "downsampling_ratio must be specified in model config"
+    io_channels = ae_config.get("io_channels", None)
+    assert io_channels is not None, "io_channels must be specified in model config"
+    sample_rate = config.get("sample_rate", None)
+    assert sample_rate is not None, "sample_rate must be specified in model config"
+
+    # Conditional VAE specific configs
+    cond_def = ae_config.get("cond_def", None)
+    assert cond_def is not None, "cond_def must be specified for conditional autoencoder"
+    cond_embed_dim = ae_config.get("cond_embed_dim", 256)
+
+    in_channels = ae_config.get("in_channels", None)
+    out_channels = ae_config.get("out_channels", None)
+
+    pretransform = ae_config.get("pretransform", None)
+
+    if pretransform is not None:
+        pretransform = create_pretransform_from_config(pretransform, sample_rate)
+
+    if bottleneck is not None:
+        bottleneck = create_bottleneck_from_config(bottleneck)
+
+    soft_clip = ae_config["decoder"].get("soft_clip", False)
+    
+    return AudioConditionalVariationalAutoEncoder(
+        encoder,
+        decoder,
+        io_channels=io_channels,
+        latent_dim=latent_dim,
+        downsampling_ratio=downsampling_ratio,
+        sample_rate=sample_rate,
+        cond_def=cond_def,
+        cond_embed_dim=cond_embed_dim,
+        bottleneck=bottleneck,
+        pretransform=pretransform,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        soft_clip=soft_clip
     )

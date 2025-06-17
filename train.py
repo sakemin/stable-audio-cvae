@@ -39,6 +39,25 @@ def main():
     with open(args.dataset_config) as f:
         dataset_config = json.load(f)
 
+    # Extract conditional autoencoder settings
+    is_conditional = model_config.get('model_type') == 'conditional_autoencoder'
+    cond_keys = None
+    
+    if is_conditional:
+        # Get condition keys from model config or training config
+        cond_keys = model_config.get('cond_keys', None)
+        if cond_keys is None and 'training' in model_config:
+            cond_keys = model_config['training'].get('cond_keys', None)
+        
+        # Default condition keys if not specified
+        if cond_keys is None:
+            cond_keys = ['condition']  # Simplified to single key
+            print(f"No cond_keys specified for conditional autoencoder, using default: {cond_keys}")
+        else:
+            print(f"Using condition keys: {cond_keys}")
+            
+        print(f"Conditional autoencoder mode enabled with {len(cond_keys)} condition key(s)")
+
     train_dl = create_dataloader_from_config(
         dataset_config,
         batch_size=args.batch_size,
@@ -80,6 +99,14 @@ def main():
     if args.remove_pretransform_weight_norm == "post_load":
         remove_weight_norm_from_model(model.pretransform)
 
+    # Create training wrapper with conditional support
+    if is_conditional:
+        # Add cond_keys to training config if not already present
+        if 'training' not in model_config:
+            model_config['training'] = {}
+        if 'cond_keys' not in model_config['training']:
+            model_config['training']['cond_keys'] = cond_keys
+
     training_wrapper = create_training_wrapper_from_config(model_config, model)
 
     exc_callback = ExceptionCallback()
@@ -105,16 +132,25 @@ def main():
     ckpt_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1)
     save_model_config_callback = ModelConfigEmbedderCallback(model_config)
 
+    # Create demo callback with conditional support
+    demo_kwargs = {}
+    if is_conditional and cond_keys is not None:
+        demo_kwargs['cond_keys'] = cond_keys
+
     if args.val_dataset_config:
-        demo_callback = create_demo_callback_from_config(model_config, demo_dl=val_dl)
+        demo_callback = create_demo_callback_from_config(model_config, demo_dl=val_dl, **demo_kwargs)
     else:
-        demo_callback = create_demo_callback_from_config(model_config, demo_dl=train_dl)
+        demo_callback = create_demo_callback_from_config(model_config, demo_dl=train_dl, **demo_kwargs)
 
     #Combine args and config dicts
     args_dict = vars(args)
     args_dict.update({"model_config": model_config})
     args_dict.update({"dataset_config": dataset_config})
     args_dict.update({"val_dataset_config": val_dataset_config})
+    
+    # Add conditional autoencoder info to logged config
+    if is_conditional:
+        args_dict.update({"is_conditional": True, "cond_keys": cond_keys})
 
     if args.logger == 'wandb':
         push_wandb_config(logger, args_dict)
@@ -135,7 +171,11 @@ def main():
         else:
             strategy = args.strategy
     else:
-        strategy = 'ddp_find_unused_parameters_true' if args.num_gpus > 1 else "auto"
+        # Use ddp_find_unused_parameters_true for conditional models to handle unused parameters
+        if is_conditional:
+            strategy = 'ddp_find_unused_parameters_true'
+        else:
+            strategy = 'ddp_find_unused_parameters_true' if args.num_nodes > 1 or torch.cuda.device_count() > 1 else "auto"
 
     val_args = {}
     

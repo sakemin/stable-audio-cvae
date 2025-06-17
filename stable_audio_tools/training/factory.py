@@ -9,7 +9,7 @@ def create_training_wrapper_from_config(model_config, model):
     training_config = model_config.get('training', None)
     assert training_config is not None, 'training config must be specified in model config'
 
-    if model_type == 'autoencoder':
+    if model_type == 'autoencoder' or model_type == 'conditional_autoencoder':
         from .autoencoders import AutoencoderTrainingWrapper
 
         ema_copy = None
@@ -177,7 +177,7 @@ def create_demo_callback_from_config(model_config, **kwargs):
 
     demo_config = training_config.get("demo", {})
 
-    if model_type == 'autoencoder':
+    if model_type == 'autoencoder' or model_type == 'conditional_autoencoder':
         from .autoencoders import AutoencoderDemoCallback
         return AutoencoderDemoCallback(
             demo_every=demo_config.get("demo_every", 2000), 

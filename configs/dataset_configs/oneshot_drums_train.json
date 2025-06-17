@@ -1,0 +1,15 @@
+{
+  "dataset_type": "audio_dir",
+  "sample_rate": 44100,
+  "sample_size": 65536,
+  "random_crop": true,
+  "force_channels": 2,
+  "drop_last": true,
+  "datasets": [
+    {
+      "id": "oneshot_drums_train",
+      "path": "/home/sake/userdata/sake/oneshot_data",
+      "custom_metadata_module": "configs/dataset_configs/oneshot_drums_train_metadata.py"
+    }
+  ]
+}
