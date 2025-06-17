@@ -984,21 +984,38 @@ class ConditionEmbedding(nn.Module):
       category, then average).
     """
 
-    def __init__(self, cond_def, embed_dim: int):
+    def __init__(self, cond_def, embed_dim: int, enable_dropout: bool = True):
         super().__init__()
         self.embed_dim = embed_dim
+        self.enable_dropout = enable_dropout
+        
         if isinstance(cond_def, int):
             self._mode = "continuous"
             self.proj = nn.Linear(cond_def, embed_dim)
+            # For continuous mode, we'll use zero embedding for dropout
+            if self.enable_dropout:
+                self.dropout_embed = nn.Parameter(torch.zeros(embed_dim))
         else:
             self._mode = "categorical"
+            # Add one extra embedding for dropout token (index = num_classes)
             self.tables = nn.ModuleList([
-                nn.Embedding(num_embeddings=n_cls, embedding_dim=embed_dim)
+                nn.Embedding(num_embeddings=n_cls + (1 if enable_dropout else 0), embedding_dim=embed_dim)
                 for n_cls in cond_def
             ])
+            self.num_classes = cond_def  # Store original number of classes for each category
+            
+    def get_dropout_token(self):
+        """Return the dropout token index for categorical conditions."""
+        if self._mode == "categorical" and self.enable_dropout:
+            # Dropout token is at index num_classes for each category
+            return [n_cls for n_cls in self.num_classes]
+        return None
 
     def forward(self, c: torch.Tensor) -> torch.Tensor:  # (B,*) -> (B,E)
         if self._mode == "continuous":
+            # For continuous mode, check if we should use dropout embedding
+            if self.enable_dropout and torch.all(c == -1):  # -1 indicates dropout
+                return self.dropout_embed.unsqueeze(0).repeat(c.shape[0], 1)
             return self.proj(c)
         # categorical
         if c.dim() != 2:
@@ -1264,6 +1281,7 @@ class AudioConditionalVariationalAutoEncoder(AudioAutoencoder):
         in_channels = None,
         out_channels = None,
         soft_clip = False,
+        enable_cond_dropout: bool = True,
         **kwargs
     ):
         # Initialize parent class
@@ -1285,7 +1303,8 @@ class AudioConditionalVariationalAutoEncoder(AudioAutoencoder):
         # Conditioning components
         self.cond_def = cond_def
         self.cond_embed_dim = cond_embed_dim
-        self.cond_embed = ConditionEmbedding(cond_def, cond_embed_dim)
+        self.enable_cond_dropout = enable_cond_dropout
+        self.cond_embed = ConditionEmbedding(cond_def, cond_embed_dim, enable_dropout=enable_cond_dropout)
         
         # Wrap encoder and decoder with conditional versions
         self.conditional_encoder = ConditionalEncoder(self.encoder, cond_embed_dim)
@@ -1467,6 +1486,7 @@ def create_conditional_autoencoder_from_config(config: Dict[str, Any]):
     cond_def = ae_config.get("cond_def", None)
     assert cond_def is not None, "cond_def must be specified for conditional autoencoder"
     cond_embed_dim = ae_config.get("cond_embed_dim", 256)
+    enable_cond_dropout = ae_config.get("enable_cond_dropout", True)
 
     in_channels = ae_config.get("in_channels", None)
     out_channels = ae_config.get("out_channels", None)
@@ -1490,6 +1510,7 @@ def create_conditional_autoencoder_from_config(config: Dict[str, Any]):
         sample_rate=sample_rate,
         cond_def=cond_def,
         cond_embed_dim=cond_embed_dim,
+        enable_cond_dropout=enable_cond_dropout,
         bottleneck=bottleneck,
         pretransform=pretransform,
         in_channels=in_channels,

@@ -162,4 +162,4 @@ cython_debug/
 *.ckpt
 *.wav
 wandb/*
-ckpt/cvae_e0.pt
+ckpt/*

@@ -103,7 +103,8 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             latent_mask_ratio = 0.0,
             teacher_model: Optional[AudioAutoencoder] = None,
             clip_grad_norm = 0.0,
-            cond_keys: Optional[list] = None
+            cond_keys: Optional[list] = None,
+            condition_dropout_prob: float = 0.0
     ):
         super().__init__()
 
@@ -124,6 +125,7 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         # Check if this is a conditional autoencoder
         self.is_conditional = isinstance(autoencoder, AudioConditionalVariationalAutoEncoder)
         self.cond_keys = cond_keys
+        self.condition_dropout_prob = condition_dropout_prob
 
         if optimizer_configs is None:
             optimizer_configs ={
@@ -429,6 +431,7 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                 val_loss_dict[eval_key] = loss_value
 
         self.validation_step_outputs.append(val_loss_dict)
+
         return val_loss_dict
 
     def on_validation_epoch_end(self):
@@ -442,8 +445,7 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
         for key, value in sum_loss_dict.items():
             val_loss = value / len(self.validation_step_outputs)
-            val_loss = self.all_gather(val_loss).mean().item()
-            log_metric(self.logger, f"val/{key}", val_loss)
+            self.log(f"val/{key}", val_loss, sync_dist=True, prog_bar=True, logger=True)
 
         self.validation_step_outputs.clear()  # free memory
 
@@ -483,6 +485,10 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             condition = extract_condition_from_metadata(metadata, self.cond_keys)
             if condition is not None:
                 condition = condition.to(reals.device)
+                
+                # Apply condition dropout during training
+                condition = self.apply_condition_dropout(condition, self.condition_dropout_prob)
+                
                 if batch_idx < 3:
                     print(f"[DEBUG] Extracted condition: shape={condition.shape}, dtype={condition.dtype}")
                     print(f"[DEBUG] Sample conditions: {condition[:min(5, len(condition))].tolist()}")
@@ -678,6 +684,52 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             save_model(model, path)
         else:
             torch.save({"state_dict": model.state_dict()}, path)
+
+    def apply_condition_dropout(self, condition, dropout_prob=None):
+        """Apply condition dropout during training.
+        
+        Args:
+            condition: The original condition tensor (B, C) where C=1 for categorical
+            dropout_prob: Probability of applying dropout (uses self.condition_dropout_prob if None)
+            
+        Returns:
+            Modified condition tensor with some conditions replaced by dropout tokens
+        """
+        if not self.training or condition is None:
+            return condition
+            
+        if dropout_prob is None:
+            dropout_prob = self.condition_dropout_prob
+            
+        if dropout_prob <= 0.0:
+            return condition
+            
+        # Create dropout mask
+        batch_size = condition.shape[0]
+        dropout_mask = torch.rand(batch_size, device=condition.device) < dropout_prob
+        num_dropped = dropout_mask.sum().item()
+        
+        if self.is_conditional and hasattr(self.autoencoder, 'cond_embed'):
+            dropout_tokens = self.autoencoder.cond_embed.get_dropout_token()
+            if dropout_tokens is not None:
+                # For categorical conditions with single category (5 classes: 0-4, dropout token: 5)
+                dropout_token_idx = dropout_tokens[0]  # Get dropout token for first (and only) category
+                
+                # Create dropout condition tensor
+                dropout_condition = torch.full_like(condition, dropout_token_idx)
+                
+                # Apply dropout mask
+                original_condition = condition.clone()
+                condition = torch.where(dropout_mask.unsqueeze(1), dropout_condition, condition)
+                
+                # Debug logging (only occasionally to avoid spam)
+                if hasattr(self, 'global_step') and self.global_step % 100 == 0 and num_dropped > 0:
+                    print(f"[DEBUG] Condition dropout applied: {num_dropped}/{batch_size} conditions dropped (prob={dropout_prob:.2f})")
+                    print(f"[DEBUG] Original conditions (first 5): {original_condition[:5].flatten().tolist()}")
+                    print(f"[DEBUG] Modified conditions (first 5): {condition[:5].flatten().tolist()}")
+                    print(f"[DEBUG] Dropout token index: {dropout_token_idx}")
+                
+        return condition
 
 class AutoencoderDemoCallback(pl.Callback):
     def __init__(

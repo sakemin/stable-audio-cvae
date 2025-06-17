@@ -203,8 +203,17 @@ def run(cfg):
     dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True, num_workers=4, drop_last=True)
     dl_test = DataLoader(ds_test, batch_size=cfg.batch_size, shuffle=False, num_workers=4)
 
-    model = AudioCVAE(cond_def=[N_LABELS], cond_embed_dim=cfg.cond_embed, encoder_cfg=cfg.encoder_cfg, decoder_cfg=cfg.decoder_cfg).to(device)
+    model = AudioCVAE(
+        cond_def=[N_LABELS], 
+        cond_embed_dim=cfg.cond_embed, 
+        cond_dropout_prob=cfg.cond_dropout_prob,
+        encoder_cfg=cfg.encoder_cfg, 
+        decoder_cfg=cfg.decoder_cfg
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
+
+    print(f"🎵 Training CVAE with condition dropout probability: {cfg.cond_dropout_prob}")
+    print(f"📊 Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     step = 0
 
@@ -258,8 +267,9 @@ def parse():
     ap = argparse.ArgumentParser("Train Conditional Audio‑CVAE on drum one‑shots")
     ap.add_argument("--data_root", required=True, help="/home/sake/userdata/sake/oneshot_data")
     ap.add_argument("--epochs", type=int, default=150)
-    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--cond_embed", type=int, default=128)
+    ap.add_argument("--cond_dropout_prob", type=float, default=0.5, help="Probability of dropping condition during training")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--out_dir", default="ckpt")
     ap.add_argument("--log_int", type=int, default=10)

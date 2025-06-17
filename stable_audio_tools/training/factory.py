@@ -52,7 +52,8 @@ def create_training_wrapper_from_config(model_config, model):
             ema_copy=ema_copy if use_ema else None,
             force_input_mono=training_config.get("force_input_mono", False),
             latent_mask_ratio=latent_mask_ratio,
-            teacher_model=teacher_model
+            teacher_model=teacher_model,
+            condition_dropout_prob=training_config.get("condition_dropout_prob", 0.0)
         )
     elif model_type == 'diffusion_uncond':
         from .diffusion import DiffusionUncondTrainingWrapper
