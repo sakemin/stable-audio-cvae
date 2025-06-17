@@ -723,11 +723,11 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                 condition = torch.where(dropout_mask.unsqueeze(1), dropout_condition, condition)
                 
                 # Debug logging (only occasionally to avoid spam)
-                if hasattr(self, 'global_step') and self.global_step % 100 == 0 and num_dropped > 0:
-                    print(f"[DEBUG] Condition dropout applied: {num_dropped}/{batch_size} conditions dropped (prob={dropout_prob:.2f})")
-                    print(f"[DEBUG] Original conditions (first 5): {original_condition[:5].flatten().tolist()}")
-                    print(f"[DEBUG] Modified conditions (first 5): {condition[:5].flatten().tolist()}")
-                    print(f"[DEBUG] Dropout token index: {dropout_token_idx}")
+                # if hasattr(self, 'global_step') and self.global_step % 100 == 0 and num_dropped > 0:
+                #     print(f"[DEBUG] Condition dropout applied: {num_dropped}/{batch_size} conditions dropped (prob={dropout_prob:.2f})")
+                #     print(f"[DEBUG] Original conditions (first 5): {original_condition[:5].flatten().tolist()}")
+                #     print(f"[DEBUG] Modified conditions (first 5): {condition[:5].flatten().tolist()}")
+                #     print(f"[DEBUG] Dropout token index: {dropout_token_idx}")
                 
         return condition
 
