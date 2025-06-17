@@ -17,8 +17,8 @@ pytorch_lightning==2.1.0
 PyWavelets==1.4.1
 safetensors
 sentencepiece==0.1.99
-torch==2.1.0
-torchaudio==2.1.0
+torch==2.5.0
+torchaudio==2.5.0
 torchmetrics==0.11.4
 tqdm
 transformers
@@ -30,7 +30,7 @@ x-transformers<1.27.0
 numpy
 scikit-learn
 plotly
-flash_attn==2.5.8
+flash_attn
 nbformat>=4.2.0
 anywidget
 dash
