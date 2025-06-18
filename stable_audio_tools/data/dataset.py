@@ -958,3 +958,112 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
             latent_crop_length=dataset_config.get("latent_crop_length", None),
             resampled_shards=dataset_config.get("resampled_shards", True)
         ).data_loader
+
+    elif dataset_type == "audio_files":
+
+        # ---------------------------------------------------------
+        # NEW: support configs that directly list individual files
+        # ---------------------------------------------------------
+        # Example config keys:
+        #   "dataset_type": "audio_files"
+        #   "files": ["/abs/path/one.wav", ...]
+        #   "custom_metadata_module": "path/to/module.py" (optional)
+        #   any other common keys (random_crop, drop_last, etc.)
+
+        file_list = dataset_config.get("files", [])
+        assert len(file_list) > 0, "'files' must be a non-empty list of file paths when using dataset_type 'audio_files'"
+
+        # Optional custom metadata extractor identical to other branches
+        custom_metadata_fn = None
+        custom_metadata_module_path = dataset_config.get("custom_metadata_module", None)
+        if custom_metadata_module_path is not None:
+            spec = importlib.util.spec_from_file_location("metadata_module", custom_metadata_module_path)
+            metadata_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(metadata_module)
+            custom_metadata_fn = metadata_module.get_custom_metadata
+
+        class FileListDataset(torch.utils.data.Dataset):
+            """Dataset that loads explicit list of audio files."""
+            def __init__(self, files, sample_rate, sample_size, random_crop=True, force_channels="stereo", md_fn=None):
+                super().__init__()
+                self.files = files
+                self.sr = sample_rate
+                self.pad_crop = PadCrop_Normalized_T(sample_size, sample_rate, randomize=random_crop)
+                self.force_channels = force_channels
+                self.augment = torch.nn.Sequential(PhaseFlipper())
+                self.encoding = torch.nn.Sequential(
+                    Stereo() if force_channels == "stereo" else torch.nn.Identity(),
+                    Mono() if force_channels == "mono" else torch.nn.Identity(),
+                )
+                self.custom_md_fn = md_fn
+
+            def __len__(self):
+                return len(self.files)
+
+            def __getitem__(self, idx):
+                path = self.files[idx]
+                try:
+                    audio, in_sr = torchaudio.load(path)
+                    if in_sr != self.sr:
+                        audio = T.Resample(in_sr, self.sr)(audio)
+
+                    audio, t_start, t_end, sec_start, sec_total, padding_mask = self.pad_crop(audio)
+
+                    # simple silence rejection
+                    if is_silence(audio):
+                        # choose a different random index
+                        return self[random.randrange(len(self))]
+
+                    audio = self.augment(audio).clamp(-1, 1)
+                    audio = self.encoding(audio)
+
+                    info = {
+                        "path": path,
+                        "timestamps": (t_start, t_end),
+                        "seconds_start": sec_start,
+                        "seconds_total": sec_total,
+                        "padding_mask": padding_mask,
+                        "sample_rate": self.sr,
+                    }
+
+                    if self.custom_md_fn is not None:
+                        extra = self.custom_md_fn(info, audio)
+                        info.update(extra)
+                        if info.get("__reject__", False):
+                            return self[random.randrange(len(self))]
+
+                    # allow metadata function to insert extra audio tensors in __audio__
+                    if "__audio__" in info:
+                        for k, v in info["__audio__"].items():
+                            v, _, _, _, _, _ = self.pad_crop(v)
+                            v = self.encoding(self.augment(v)).clamp(-1, 1)
+                            info[k] = v
+                        del info["__audio__"]
+
+                    info["audio"] = audio
+                    return audio, info
+                except Exception as e:
+                    print(f"Couldn't load file {path}: {e}")
+                    return self[random.randrange(len(self))]
+
+        file_dataset = FileListDataset(
+            file_list,
+            sample_rate=sample_rate,
+            sample_size=sample_size,
+            random_crop=dataset_config.get("random_crop", True),
+            force_channels=force_channels,
+            md_fn=custom_metadata_fn,
+        )
+
+        return torch.utils.data.DataLoader(
+            file_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            persistent_workers=True,
+            pin_memory=True,
+            drop_last=dataset_config.get("drop_last", True),
+            collate_fn=collation_fn,
+        )
+
+    # --- end of new audio_files branch ---
