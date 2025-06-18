@@ -341,6 +341,35 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             if "mel" in eval_loss_config:
                 self.eval_losses["mel"] = auraloss.MelSTFTLoss(
                     sample_rate, **eval_loss_config["mel"])
+        else:
+            # Add default validation metrics when eval_loss_config is None
+            print("[INFO] No eval_loss_config provided, using default validation metrics")
+            # Add basic STFT loss for validation
+            default_stft_config = {
+                "fft_size": 1024,
+                "hop_size": 256, 
+                "win_length": 1024,
+                "w_sc": 1.0,
+                "w_log_mag": 1.0,
+                "w_lin_mag": 0.0,
+                "w_phs": 0.0,
+                "sample_rate": sample_rate
+            }
+            self.eval_losses["stft"] = auraloss.STFTLoss(**default_stft_config)
+            
+            # Add mel spectrogram loss
+            default_mel_config = {
+                "fft_size": 1024,
+                "hop_size": 256,
+                "win_length": 1024,
+                "n_mels": 80,
+                "sample_rate": sample_rate,
+                "w_sc": 1.0,
+                "w_log_mag": 1.0,
+                "w_lin_mag": 0.0,
+                "w_phs": 0.0
+            }
+            self.eval_losses["mel"] = auraloss.MelSTFTLoss(**default_mel_config)
 
         self.validation_step_outputs = []
 
@@ -430,11 +459,18 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
                 val_loss_dict[eval_key] = loss_value
 
+        # Debug logging for validation (only occasionally to avoid spam)
+        if batch_idx == 0:  # Log only for first batch of each validation epoch
+            print(f"[DEBUG] Validation step {batch_idx}: computed metrics {list(val_loss_dict.keys())}")
+            print(f"[DEBUG] Validation values: {val_loss_dict}")
+
         self.validation_step_outputs.append(val_loss_dict)
 
         return val_loss_dict
 
     def on_validation_epoch_end(self):
+        print(f"[DEBUG] Validation epoch ended. Number of validation steps: {len(self.validation_step_outputs)}")
+        
         sum_loss_dict = {}
         for loss_dict in self.validation_step_outputs:
             for key, value in loss_dict.items():
@@ -442,10 +478,16 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                     sum_loss_dict[key] = value
                 else:
                     sum_loss_dict[key] += value
-
+        
+        print(f"[DEBUG] Sum loss dict keys: {list(sum_loss_dict.keys())}")
+        
         for key, value in sum_loss_dict.items():
             val_loss = value / len(self.validation_step_outputs)
-            self.log(f"val/{key}", val_loss, sync_dist=True, prog_bar=True, logger=True)
+            val_loss = self.all_gather(val_loss).mean().item()
+            print(f"[DEBUG] Logging val/{key}: {val_loss} at step {self.global_step}")
+            log_metric(self.logger, f"val/{key}", val_loss, step=self.global_step)
+            
+        self.log_dict(sum_loss_dict, prog_bar=True, on_epoch=True)
 
         self.validation_step_outputs.clear()  # free memory
 

@@ -104,7 +104,10 @@ def logger_project_name(logger) -> str:
 def log_metric(logger, key, value, step=None):
     from pytorch_lightning.loggers import WandbLogger, CometLogger
     if isinstance(logger, WandbLogger):
-        logger.experiment.log({key: value})
+        if step is not None:
+            logger.experiment.log({key: value, "trainer/global_step": step})
+        else:
+            logger.experiment.log({key: value})
     elif isinstance(logger, CometLogger):
         logger.experiment.log_metrics({key: value}, step=step)
 
