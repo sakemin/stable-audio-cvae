@@ -9,8 +9,8 @@
             "type": "dac",
             "config": {
                 "in_channels": 2,
-                "latent_dim": 64,
-                "d_model": 64,
+                "latent_dim": 128,
+                "d_model": 128,
                 "strides": [4, 4, 8, 8]
             }
         },
@@ -18,8 +18,8 @@
             "type": "dac",
             "config": {
                 "out_channels": 2,
-                "latent_dim": 32,
-                "channels": 512,
+                "latent_dim": 64,
+                "channels": 1024,
                 "rates": [8, 8, 4, 4]
             }
         },
@@ -27,8 +27,8 @@
             "type": "vae"
         },
         "cond_def": [5],
-        "cond_embed_dim": 128,
-        "latent_dim": 32,
+        "cond_embed_dim": 256,
+        "latent_dim": 64,
         "downsampling_ratio": 1024,
         "io_channels": 2
     },
