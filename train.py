@@ -70,7 +70,7 @@ def main():
     val_dl = None
     val_dataset_config = None
 
-    if args.val_dataset_config:
+    if args.val_dataset_config and not args.no_val:
         with open(args.val_dataset_config) as f:
             val_dataset_config = json.load(f)
 
